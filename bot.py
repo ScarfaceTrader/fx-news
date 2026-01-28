@@ -43,7 +43,6 @@ ORANGE_BLOCK_MIN = 60
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -72,10 +71,15 @@ def fetch_ff_calendar_html(day: datetime) -> str:
     # Ej: jan27.2026
     day_str = day.strftime("%b").lower() + day.strftime("%d") + "." + day.strftime("%Y")
     url = f"https://www.forexfactory.com/calendar?day={day_str}"
+
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.forexfactory.com/calendar",
+        "Connection": "keep-alive",
     }
+
     r = requests.get(url, headers=headers, cookies=ff_cookies_for_quito(), timeout=30)
     r.raise_for_status()
     return r.text
@@ -107,7 +111,7 @@ def parse_events_from_html(html: str, day: datetime):
         ecell = row.select_one("td.calendar__event")
         title = ecell.get_text(" ", strip=True) if ecell else ""
 
-        # Impacto
+        # Impacto (heurística por fragmentos)
         impact_cell = row.select_one("td.calendar__impact")
         impact = "unknown"
         if impact_cell:
@@ -154,7 +158,7 @@ def day_sessions(day: datetime):
     return [("Sesión 1", s1), ("Sesión 2", s2)]
 
 def is_holiday_day(relevant_events):
-    # simple: si ForexFactory pone "Holiday" en EUR/USD => no operas
+    # simple: si ForexFactory pone "Holiday" en EUR/USD => no operas el día
     for e in relevant_events:
         t = (e["title"] or "").lower()
         if "holiday" in t:
@@ -176,14 +180,12 @@ def build_report_for_day(day: datetime):
 
     lines = [f"📅 {day.strftime('%a %d %b %Y')} — {PAIR} (Quito)"]
 
-    # Reglas por sesión
     for sname, (start, end) in day_sessions(day):
         # 🔴 Si hay RED dentro de la sesión => cancelas la sesión completa
         red_in_session = any(e["impact"] == "red" and start <= e["dt"] <= end for e in relevant)
         if red_in_session:
             lines.append(
-                f"🔴 {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: "
-                f"🚫 NO operar (Red news dentro de la sesión)"
+                f"🔴 {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: 🚫 NO operar (Red news dentro de la sesión)"
             )
             continue
 
@@ -193,7 +195,6 @@ def build_report_for_day(day: datetime):
             if e["impact"] == "orange":
                 bstart = e["dt"] - timedelta(minutes=ORANGE_BLOCK_MIN)
                 bend   = e["dt"] + timedelta(minutes=ORANGE_BLOCK_MIN)
-                # si intersecta con sesión
                 if not (bend < start or bstart > end):
                     blocks.append((max(bstart, start), min(bend, end), e))
 
@@ -216,17 +217,14 @@ def build_report_for_day(day: datetime):
 
         if not windows:
             lines.append(
-                f"🟠 {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: "
-                f"🚫 NO operar (bloqueos Orange cubren la sesión)"
+                f"🟠 {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: 🚫 NO operar (bloqueos Orange cubren la sesión)"
             )
         else:
             win_txt = ", ".join([f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a, b in windows])
             lines.append(
-                f"✅ {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: "
-                f"Operable en {win_txt}"
+                f"✅ {sname} {start.strftime('%H:%M')}–{end.strftime('%H:%M')}: Operable en {win_txt}"
             )
 
-    # Lista eventos del día (EUR/USD)
     if relevant:
         lines.append("\n🗞️ Eventos EUR/USD del día:")
         for e in relevant:
@@ -262,7 +260,7 @@ async def on_ready():
     if not weekly_report.is_running():
         weekly_report.start()
 
-# CLAVE: asegura que los comandos funcionen
+# CLAVE: asegura que los comandos funcionen SIEMPRE
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -278,17 +276,29 @@ async def ping(ctx):
 
 @bot.command()
 async def ffhoy(ctx):
-    day = datetime.now(TZ)
-    report = build_report_for_day(day)
-    for chunk in split_discord(report):
-        await ctx.send(f"```{chunk}```")
+    msg = await ctx.send("⏳ Consultando ForexFactory (Quito)…")
+    try:
+        day = datetime.now(TZ)
+        report = build_report_for_day(day)
+        for chunk in split_discord(report):
+            await ctx.send(f"```{chunk}```")
+        await msg.edit(content="✅ Listo.")
+    except Exception as e:
+        await msg.edit(content="❌ Falló al consultar ForexFactory.")
+        await ctx.send(f"```ERROR: {type(e).__name__}: {e}```")
 
 @bot.command()
 async def ffsemana(ctx):
-    day = datetime.now(TZ)
-    report = build_report_week(day)
-    for chunk in split_discord(report):
-        await ctx.send(f"```{chunk}```")
+    msg = await ctx.send("⏳ Armando reporte semanal (puede tardar)…")
+    try:
+        day = datetime.now(TZ)
+        report = build_report_week(day)
+        for chunk in split_discord(report):
+            await ctx.send(f"```{chunk}```")
+        await msg.edit(content="✅ Listo.")
+    except Exception as e:
+        await msg.edit(content="❌ Falló el reporte semanal.")
+        await ctx.send(f"```ERROR: {type(e).__name__}: {e}```")
 
 # =========================
 # SCHEDULED REPORTS
